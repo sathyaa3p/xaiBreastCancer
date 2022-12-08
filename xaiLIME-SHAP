@@ -1,0 +1,167 @@
+from dice_ml import Dice
+
+import dice_ml
+import shap
+import pandas as pd
+import lime.lime_tabular
+import lime
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+import pdb
+import random
+
+bcwData = pd.read_csv('https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer-wisconsin/wdbc.data',delimiter=',',header=None)
+print(bcwData.iat[0,1])
+bcwData.replace('M',1,inplace=True)
+bcwData.replace('B',0,inplace=True)
+bcwData.drop(0,axis=1,inplace=True)
+
+
+bcwData = bcwData.to_numpy()
+labels = bcwData[:,0]
+data = bcwData[:,1:]
+
+mins = np.min(bcwData[:,1:], axis=0)
+maxs = np.max(bcwData[:,1:], axis=0)
+bcwDataNorm = bcwData
+bcwDataNorm[:,1:] = (2/(maxs-mins))*bcwData[:,1:] + (1 - (2*maxs/(maxs-mins)))
+print(bcwDataNorm)
+print(bcwDataNorm.shape)
+test_size = round(0.2*bcwDataNorm.shape[0])
+testIDs = [random.randint(0,bcwDataNorm.shape[0]-1) for a in range(test_size)]
+print(testIDs)
+allIDs = [a for a in range(bcwDataNorm.shape[0])]
+trainIDs = list(set(allIDs)-set(testIDs))
+
+## transformations
+transform = transforms.Compose(
+    [transforms.ToTensor()])
+BATCH_SIZE = 32
+## download and load training dataset
+trainloader = torch.utils.data.DataLoader(bcwDataNorm[trainIDs], batch_size=BATCH_SIZE,shuffle=True, num_workers=2)
+testloader = torch.utils.data.DataLoader(bcwDataNorm[testIDs], batch_size=len(testIDs),shuffle=True, num_workers=2)
+
+class MyModel(nn.Module):
+    def __init__(self):
+        super(MyModel, self).__init__()
+
+        self.d1 = nn.Linear(30, 72)
+        self.d2 = nn.Linear(72, 36)
+        self.d3 = nn.Linear(36,18)
+        self.d4 = nn.Linear(18,2)
+
+    def forward(self, x):
+
+        x = self.d1(x)
+        x = F.relu(x)
+
+        x = self.d2(x)
+        x = F.relu(x)
+
+        x = self.d3(x)
+        x = F.relu(x)
+        
+        logits = self.d4(x)
+        out = F.softmax(logits, dim=-1)
+        return out
+
+## compute accuracy
+def get_accuracy(logit, target, batch_size):
+    ''' Obtain accuracy for training round '''
+    corrects = (torch.max(logit, 1)[1].view(target.size()).data == target.data).sum()
+    accuracy = 100.0 * corrects/batch_size
+    return corrects
+
+def evalModel(data):
+  data_tensor = torch.Tensor(data)
+  model.eval()
+  with torch.no_grad():
+    outs = model(data_tensor)
+
+  return outs.numpy()
+  
+learning_rate = 0.001
+num_epochs = 50
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model = MyModel()
+model = model.to(device)
+criterion = nn.CrossEntropyLoss()
+
+# Model training
+for epoch in range(num_epochs):
+    train_running_loss = 0.0
+    num_correct = 0.0
+    total_samples = 0.0
+
+    model = model.train()
+
+    ## training step
+    for i, xy in enumerate(trainloader):
+        
+        x = xy[:,1:].float() # 1st column is the label
+        y = xy[:,0].type(torch.LongTensor)
+
+        x = x.to(device)
+        y = y.to(device)
+
+        ## forward + backprop + loss
+        logits = model(x)
+        
+        loss = criterion(logits, y)
+        optimizer.zero_grad()
+        loss.backward()
+
+        ## update model params
+        optimizer.step()
+
+        train_running_loss += loss.detach().item()
+        num_correct += get_accuracy(logits, y, BATCH_SIZE)
+        total_samples += len(y)
+
+    num_correct_test = 0.0
+    total_samples_test = 0.0
+    for j, xytest in enumerate(testloader):   
+      xtest = xytest[:,1:].float()
+      ytest = xytest[:,0].type(torch.LongTensor)
+
+      xtest = xtest.to(device)
+      ytest = ytest.to(device)
+
+      ypred = model(xtest)
+      num_correct_test += get_accuracy(ypred, ytest, BATCH_SIZE)
+      total_samples_test += len(ytest)
+    model.eval()
+    print('Epoch: %d | Loss: %.4f | Train Accuracy: %.4f | Test Accuracy: %.4f' \
+          %(epoch, train_running_loss / i, num_correct/total_samples, num_correct_test/total_samples_test))        
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+class_names = ['benign','malignant']
+
+feature_names = ['radius (mean)', 'texture (mean)', 'perimeter (mean)', 'area (mean)', 'smoothness (mean)', 'compactness (mean)', 'concavity (mean)', 'concave points (mean)', 'symmetry (mean)', 'fractal dimension (mean)', 
+'radius (std)', 'texture (std)', 'perimeter (std)', 'area (std)', 'smoothness (std)', 'compactness (std)', 'concavity (std)', 'concave points (std)', 'symmetry (std)', 'fractal dimension (std)', 'radius (worst)', 
+'texture (worst)', 'perimeter (worst)', 'area (worst)', 'smoothness (worst)', 'compactness (worst)', 'concavity (worst)', 'concave points (worst)', 'symmetry (worst)', 'fractal dimension (worst)']
+
+## LIME
+explainer = lime.lime_tabular.LimeTabularExplainer(bcwDataNorm[trainIDs,1:],class_names=class_names, discretize_continuous=True, mode = 'classification')
+
+#Change idx to explain different datapoints.
+idx = 101
+print(bcwDataNorm[testIDs][idx][1:])
+exp = explainer.explain_instance(bcwDataNorm[testIDs][idx][1:], evalModel)
+exp.show_in_notebook(show_table=True, show_all=True)
+
+# explain the model's predictions using SHAP
+explainerSHAP = shap.DeepExplainer(model,torch.from_numpy(bcwDataNorm[trainIDs,1:]).float())
+data_test = torch.from_numpy(bcwDataNorm[testIDs][:,1:]).float()
+print(data_test.shape)
+shap_values = explainerSHAP.shap_values(data_test)
+print(shap_values)
+# visualize the SHAP summary plot
+shap.summary_plot(shap_values[0], data_test, feature_names=feature_names)
+
+shap.dependence_plot(7, shap_values[0], bcwDataNorm[testIDs,1:], feature_names=feature_names)
